@@ -1,6 +1,6 @@
-"""Solve Akari using KNF constraints and recursive backtracking.
+"""Solve Akari using KNF constraints, backtracking, and clause learning.
 
-Run: python akari_simple.py < input.txt > output.txt
+Run: python akari_solver.py < input.txt > output.txt
 """
 
 from itertools import combinations
@@ -13,7 +13,6 @@ DIRECTIONS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
 
 def read_grid(stream):
     """Read and validate the dimensions and grid from an input stream."""
-    # Check the dimensions before using them as loop bounds or grid sizes.
     dimensions = stream.readline().split()
     if len(dimensions) != 2:
         raise ValueError("expected two positive integer dimensions")
@@ -26,7 +25,7 @@ def read_grid(stream):
         raise ValueError("dimensions must satisfy 1 <= rows*columns <= 100000")
 
     grid = []
-    # Read exactly the declared number of rows so the board is rectangular.
+    # Require a rectangular board with exactly the declared number of rows.
     for row_index in range(row_count):
         # Remove only the line ending, so accidental spaces are still rejected.
         row = stream.readline().removesuffix("\n").removesuffix("\r")
@@ -48,7 +47,6 @@ def visible_cells(grid, row, column):
     """Return a white cell and all white cells it can illuminate."""
     # A bulb lights its own square, even if walls block all four directions.
     visible = [(row, column)]
-    # Trace each direction separately so light follows straight lines.
     for row_step, column_step in DIRECTIONS:
         next_row = row + row_step
         next_column = column + column_step
@@ -58,7 +56,6 @@ def visible_cells(grid, row, column):
             if grid[next_row][next_column] != ".":
                 break
             visible.append((next_row, next_column))
-            # Advance one square along the same ray.
             next_row += row_step
             next_column += column_step
     return visible
@@ -70,7 +67,6 @@ def build_formula(grid):
     variable_at = {}
     # Assign one Boolean variable per white cell, in row order.
     for row in range(len(grid)):
-        # Gray cells have no bulb variable because bulbs cannot be placed there.
         for column in range(len(grid[0])):
             if grid[row][column] == ".":
                 cells.append((row, column))
@@ -83,7 +79,6 @@ def build_formula(grid):
     for row, column in cells:
         variable = variable_at[(row, column)]
         visible_variables = []
-        # Convert visible positions into IDs used by the Boolean constraints.
         for position in visible_cells(grid, row, column):
             other = variable_at[position]
             visible_variables.append(other)
@@ -97,7 +92,6 @@ def build_formula(grid):
     relaxation_variables = []
     # Locate numbered cells and encode their required adjacent bulb counts.
     for row in range(len(grid)):
-        # Skip unnumbered cells because they do not impose a clue count.
         for column in range(len(grid[0])):
             if grid[row][column] not in "01234":
                 continue
@@ -124,7 +118,6 @@ def build_formula(grid):
             for group in combinations(neighbors, required + 1):
                 # A True relaxation satisfies this clause and disables its rule.
                 literals = [relaxation]
-                # Negate each bulb ID so the clause requires one bulb to be off.
                 for variable in group:
                     literals.append(-variable)
                 # For a 1 clue, a pair a,b adds (relaxation OR NOT a OR NOT b).
@@ -137,67 +130,108 @@ def build_formula(grid):
     return cells, constraints, relaxation_variables
 
 
-def find_model(constraints, assignment):
-    """Propagate forced values, then recursively try both values of a variable."""
-    # Assignment entries are None (unknown), True (on), or False (off).
+def learn_clause(constraints, conflict_reasons):
+    """Record a clause excluding a decision combination proven contradictory.
+
+    conflict_reasons contains signed decision literals whose conjunction implies
+    a conflict. Negating that conjunction gives a clause implied by the formula.
+    Call only with causes established by propagation, not arbitrary assignments.
+    An empty cause set proves the formula itself unsatisfiable.
+    """
+    # === 4) Clause learning ===
+    # Sort and deduplicate so rediscovering a conflict does not add another copy.
+    clause = (sorted(-literal for literal in set(conflict_reasons)), 1)
+    if clause not in constraints:
+        constraints.append(clause)
+    return clause
+
+
+def solve_constraints(constraints, assignment):
+    """Initialize an isolated search and return a satisfying assignment, if any."""
+    # Share learned clauses across siblings, but never across penalty budgets
+    # or separate calls. Copy the formula so learning leaves the caller's intact.
+    search_constraints = list(constraints)
+    reasons = [None] * len(assignment)
+    for variable in range(1, len(assignment)):
+        if assignment[variable] is not None:
+            # Treat caller-supplied assignments as assumptions, not formula facts.
+            literal = variable if assignment[variable] else -variable
+            reasons[variable] = {literal}
+    return search_assignments(search_constraints, assignment, reasons)
+
+
+def search_assignments(constraints, assignment, reasons):
+    """Recursively propagate, learn from conflicts, and branch on assignments."""
+    # Invariant: the formula plus reasons[v] implies v's assigned value.
+    # Cause sets are never mutated after they are stored in reasons.
+    # === 1) Unit propagation ===
+    # Generalized for KNF: force all remaining literals when all are needed.
+    # Assignments are None (unknown), True, or False; variable ID 0 is unused.
     changed = True
-    # Repeat propagation until a full pass makes no changes: a fixed point.
+    # Repeat until no more assignments can be forced.
     while changed:
         changed = False
         # Recount each rule from its current assignments instead of caching counts.
         for literals, minimum in constraints:
             true_count = 0
             unknown_literals = []
+            conflict_reasons = set()
             # Count listed occurrences; repeated literals each count separately.
             for literal in literals:
-                # abs selects the variable; the sign selects its required value.
                 value = assignment[abs(literal)]
                 if value is None:
-                    # Unknown is distinct from False: either value is still possible.
                     unknown_literals.append(literal)
                 elif value == (literal > 0):
-                    # For example, literal -3 is true when variable 3 is False.
                     true_count += 1
+                else:
+                    # These decisions suffice to keep this occurrence false.
+                    conflict_reasons.update(reasons[abs(literal)])
 
+            # === 5) Satisfiability checks: satisfied constraint or conflict ===
             if true_count >= minimum:
-                # Already true literals are enough; nothing else must be forced.
                 continue
             # True plus unknown occurrences bounds the maximum still achievable.
             possible_count = true_count + len(unknown_literals)
             if possible_count < minimum:
                 # Even making every unknown literal true cannot rescue this rule.
+                learn_clause(constraints, conflict_reasons)
                 return None
             if possible_count == minimum:
-                # With exactly enough possible literals, every unknown is needed.
+                # Unit propagation: every remaining unknown occurrence is needed.
                 for literal in unknown_literals:
                     variable = abs(literal)
                     needed_value = literal > 0
                     if assignment[variable] is None:
-                        # Record the forced value, then revisit earlier rules too.
                         assignment[variable] = needed_value
+                        # The same fixed causes justify every value forced here.
+                        reasons[variable] = conflict_reasons
                         changed = True
                     elif assignment[variable] != needed_value:
-                        # Another occurrence in this pass forced the opposite
-                        # value, so the branch contains contradictory demands.
+                        # Opposite occurrences demand both values of this variable.
+                        learn_clause(constraints,
+                                     conflict_reasons | reasons[variable])
                         return None
 
-    # Decide on the first unknown variable; index 0 is unused because IDs start at 1.
+    # === 2) Branching ===
+    # Choose the first unknown variable and try both values.
     for variable in range(1, len(assignment)):
         if assignment[variable] is None:
-            # Try both values so a failed preference cannot exclude a solution.
             for value in (True, False):
-                # Preserve the parent's propagated state in a separate list.
+                # Copy assignments and reason references to preserve the parent.
                 branch = assignment.copy()
-                # Make one decision before propagating its consequences recursively.
                 branch[variable] = value
-                model = find_model(constraints, branch)
+                branch_reasons = reasons.copy()
+                branch_reasons[variable] = {variable if value else -variable}
+                model = search_assignments(constraints, branch, branch_reasons)
                 if model is not None:
                     return model
-                # Discarding this child restores the parent automatically;
-                # no shared trail or counters need to be undone.
+
+                # === 3) Backtracking ===
+                # Discard this child's assignments and reasons; keep learned clauses.
             # Both values failed, so no completion of this parent can succeed.
             return None
-    # No unknowns or conflicts remain, so the complete assignment satisfies all rules.
+    # === 5) Satisfiability check: complete satisfying assignment ===
+    # Propagation found no conflicts, and branching found no unknown variables.
     return assignment
 
 
@@ -205,9 +239,7 @@ def greedy_fallback(grid):
     """Place nonconflicting bulbs until every white cell is illuminated."""
     # Store board positions so the fallback works independently of the formula.
     bulbs = []
-    # Consider possible bulb locations in a fixed row order.
     for row in range(len(grid)):
-        # Only white cells can receive bulbs.
         for column in range(len(grid[0])):
             if grid[row][column] == ".":
                 already_lit = False
@@ -226,9 +258,7 @@ def greedy_fallback(grid):
 def count_violations(grid, bulbs):
     """Count numbered clues whose adjacent bulb count differs from their digit."""
     violations = 0
-    # Check every numbered cell against the final bulb positions.
     for row in range(len(grid)):
-        # Unnumbered cells do not contribute to the clue penalty R2.
         for column in range(len(grid[0])):
             if grid[row][column] in "01234":
                 adjacent_bulbs = 0
@@ -251,21 +281,21 @@ def solve_grid(grid, diagnostics=None):
     # A zero penalty is already optimal, so no search is needed.
     if best_score > 0:
         cells, constraints, relaxations = build_formula(grid)
+        # A negated relaxation is true when its clue must be enforced.
+        negative_relaxations = []
+        for variable in relaxations:
+            negative_relaxations.append(-variable)
         try:
             # Try budgets in increasing order. The greedy score is already
             # feasible, so the first smaller feasible budget proves optimality.
             for budget in range(best_score):
-                negative_relaxations = []
-                # A negated relaxation is true when its clue must be enforced.
-                for variable in relaxations:
-                    negative_relaxations.append(-variable)
                 # With m clues and budget b, at least m-b must be enforced.
                 # Add this budget without changing the base puzzle constraints.
                 limited = constraints + [(negative_relaxations, len(relaxations) - budget)]
                 # Start each budget with fresh unknowns for bulbs and relaxations.
                 assignment = [None] * (len(cells) + len(relaxations) + 1)
                 # Recursive search may take exponential time on difficult boards.
-                model = find_model(limited, assignment)
+                model = solve_constraints(limited, assignment)
                 if model is not None:
                     best_bulbs = []
                     # Extract only bulb variables; the remaining IDs relax clues.
@@ -292,7 +322,6 @@ def solve_grid(grid, diagnostics=None):
         completed[row][column] = "L"
     # R1 is zero by construction, so the total penalty is the violated clue count R2.
     output = str(best_score) + "\n"
-    # Convert each modified row back to a string in the required output format.
     for row in completed:
         output += "".join(row) + "\n"
     return output

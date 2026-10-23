@@ -9,7 +9,7 @@ import sys
 import unittest
 from unittest.mock import patch
 
-import akari_simple
+import akari_solver
 from akari_knf import score_board
 from test_akari_knf import SAMPLE, brute_optimum
 
@@ -19,7 +19,7 @@ class SimpleSolverTests(unittest.TestCase):
 
     def assert_solution(self, grid, expected_score):
         """Validate lighting, conflicts, unchanged gray cells, and the exact score."""
-        output = akari_simple.solve_grid(grid)
+        output = akari_solver.solve_grid(grid)
         lines = output.splitlines()
         self.assertEqual(len(lines), len(grid) + 1)
         score = score_board(grid, tuple(lines[1:]))
@@ -97,7 +97,7 @@ class SimpleSolverTests(unittest.TestCase):
                     break
 
             with self.subTest(case=case):
-                model = akari_simple.find_model(
+                model = akari_solver.solve_constraints(
                     constraints, [None] * (variable_count + 1)
                 )
                 self.assertEqual(model is not None, expected_satisfiable)
@@ -111,15 +111,15 @@ class SimpleSolverTests(unittest.TestCase):
         """Undo a failed True decision by discarding its copied assignment."""
         constraints = [([-1, 2], 1), ([-1, -2], 1)]
         parent = [None, None, None]
-        model = akari_simple.find_model(constraints, parent)
+        model = akari_solver.solve_constraints(constraints, parent)
         self.assertFalse(model[1])
         self.assertEqual(parent, [None, None, None])
 
     def test_recursion_limit_retains_valid_fallback(self):
         """Return the greedy board and a diagnostic if recursion is exhausted."""
         diagnostics = StringIO()
-        with patch.object(akari_simple, "find_model", side_effect=RecursionError):
-            output = akari_simple.solve_grid(SAMPLE, diagnostics)
+        with patch.object(akari_solver, "solve_constraints", side_effect=RecursionError):
+            output = akari_solver.solve_grid(SAMPLE, diagnostics)
         score = score_board(SAMPLE, tuple(output.splitlines()[1:]))
         self.assertTrue(score.illuminated)
         self.assertEqual(score.r1, 0)
@@ -136,9 +136,9 @@ class SimpleSolverTests(unittest.TestCase):
         ]
         for text in bad_inputs:
             with self.subTest(text=text), self.assertRaises(ValueError):
-                akari_simple.read_grid(StringIO(text))
-        self.assertEqual(akari_simple.read_grid(StringIO("1 2\r\n.X\r\n\n")), [".X"])
-        self.assertEqual(akari_simple.read_grid(StringIO("1 1\n.")), ["."])
+                akari_solver.read_grid(StringIO(text))
+        self.assertEqual(akari_solver.read_grid(StringIO("1 2\r\n.X\r\n\n")), [".X"])
+        self.assertEqual(akari_solver.read_grid(StringIO("1 1\n.")), ["."])
 
     def test_command_line(self):
         """Check a real subprocess for both a solved sample and invalid input."""
