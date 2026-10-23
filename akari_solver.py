@@ -1,4 +1,4 @@
-"""Solve Akari using KNF constraints, backtracking, and clause learning.
+"""Solve Akari
 
 Run: python akari_solver.py < input.txt > output.txt
 """
@@ -138,7 +138,7 @@ def learn_clause(constraints, conflict_reasons):
     Call only with causes established by propagation, not arbitrary assignments.
     An empty cause set proves the formula itself unsatisfiable.
     """
-    # === 4) Clause learning ===
+    # Clause learning 
     # Sort and deduplicate so rediscovering a conflict does not add another copy.
     clause = (sorted(-literal for literal in set(conflict_reasons)), 1)
     if clause not in constraints:
@@ -164,8 +164,6 @@ def search_assignments(constraints, assignment, reasons):
     """Recursively propagate, learn from conflicts, and branch on assignments."""
     # Invariant: the formula plus reasons[v] implies v's assigned value.
     # Cause sets are never mutated after they are stored in reasons.
-    # === 1) Unit propagation ===
-    # Generalized for KNF: force all remaining literals when all are needed.
     # Assignments are None (unknown), True, or False; variable ID 0 is unused.
     changed = True
     # Repeat until no more assignments can be forced.
@@ -187,7 +185,7 @@ def search_assignments(constraints, assignment, reasons):
                     # These decisions suffice to keep this occurrence false.
                     conflict_reasons.update(reasons[abs(literal)])
 
-            # === 5) Satisfiability checks: satisfied constraint or conflict ===
+            # Satisfiability checks: satisfied constraint or conflict 
             if true_count >= minimum:
                 continue
             # True plus unknown occurrences bounds the maximum still achievable.
@@ -195,9 +193,13 @@ def search_assignments(constraints, assignment, reasons):
             if possible_count < minimum:
                 # Even making every unknown literal true cannot rescue this rule.
                 learn_clause(constraints, conflict_reasons)
+                # Backtracking: reject this conflicting branch 
+                # Return to the caller, which can try its next decision value.
                 return None
+
+            #  Unit propagation 
+            # Generalized for KNF: force all remaining literals when all are needed.
             if possible_count == minimum:
-                # Unit propagation: every remaining unknown occurrence is needed.
                 for literal in unknown_literals:
                     variable = abs(literal)
                     needed_value = literal > 0
@@ -207,17 +209,20 @@ def search_assignments(constraints, assignment, reasons):
                         reasons[variable] = conflict_reasons
                         changed = True
                     elif assignment[variable] != needed_value:
+                        # Satisfiability check: contradictory forced values 
                         # Opposite occurrences demand both values of this variable.
                         learn_clause(constraints,
                                      conflict_reasons | reasons[variable])
+                        # Backtracking: reject this conflicting branch 
                         return None
 
-    # === 2) Branching ===
+    # Branching 
     # Choose the first unknown variable and try both values.
     for variable in range(1, len(assignment)):
         if assignment[variable] is None:
             for value in (True, False):
                 # Copy assignments and reason references to preserve the parent.
+                # After a failed child, retry from this same parent state.
                 branch = assignment.copy()
                 branch[variable] = value
                 branch_reasons = reasons.copy()
@@ -226,11 +231,11 @@ def search_assignments(constraints, assignment, reasons):
                 if model is not None:
                     return model
 
-                # === 3) Backtracking ===
-                # Discard this child's assignments and reasons; keep learned clauses.
-            # Both values failed, so no completion of this parent can succeed.
+            # Backtracking: both decision values failed 
+            # Unwind to the caller's decision loop. Child assignments stay local;
+            # learned clauses remain shared, so later branches can reuse them.
             return None
-    # === 5) Satisfiability check: complete satisfying assignment ===
+    # Satisfiability check: complete satisfying assignment 
     # Propagation found no conflicts, and branching found no unknown variables.
     return assignment
 
