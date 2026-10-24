@@ -1,0 +1,33 @@
+flowchart TD
+    input["solve_constraints(constraints, assignment)"]
+    initialize["ConstraintSearch.__init__<br/>Index rules and slack; apply root assumptions<br/>Build priority heap; initial phases = False"]
+    propagate["1. Unit propagation: propagate()<br/>Process queued rules; force values<br/>assign() updates only affected slack"]
+    conflict{"5. Satisfiability check<br/>Conflict found?"}
+    root{"Empty or root-level conflict?"}
+    none["Return None: no model under the assumptions"]
+    analyze["4. Clause learning: analyze_conflict()<br/>Resolve reasons to FirstUIP<br/>Compute asserting literal and backjump level"]
+    prioritize["prioritize_conflict()<br/>Boost recent conflicts; decay older activity"]
+    learn["4. Clause learning: learn_clause()<br/>Deduplicate and index the implied clause"]
+    backtrack["3. Backtracking: backtrack(level)<br/>Undo higher-level trail entries<br/>Restore slack and heap candidates; keep phases"]
+    assert["assign() the learned asserting literal<br/>Retain the other literals as its reason"]
+    choose["2. Branching<br/>Pop an unassigned variable by activity"]
+    complete{"5. Satisfiability check<br/>No unassigned variables remain?"}
+    model["Return the complete satisfying assignment"]
+    decide["Increase decision level<br/>assign() saved value; initially False"]
+
+    input --> initialize
+    initialize --> propagate
+    propagate --> conflict
+    conflict -->|"Yes"| root
+    root -->|"Yes"| none
+    root -->|"No"| analyze
+    analyze --> prioritize
+    prioritize --> learn
+    learn --> backtrack
+    backtrack --> assert
+    assert --> propagate
+    conflict -->|"No"| choose
+    choose --> complete
+    complete -->|"Yes"| model
+    complete -->|"No"| decide
+    decide --> propagate

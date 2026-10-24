@@ -1,0 +1,41 @@
+flowchart TD
+    main["main(argv): parse --storage list"]
+    read["read_grid(stdin): validate dimensions and cells"]
+    invalid["Invalid input: stderr; exit 2"]
+    greedy["greedy_fallback + visible_cells<br/>Build a lit, nonconflicting board"]
+    score["count_violations: save bulbs and best_score"]
+    zero{"best_score = 0?"}
+    build["build_formula<br/>Segments, illumination, relaxed clues"]
+    bounds["lower_bound = 0; budget = 0"]
+    more{"lower_bound < best_score?"}
+    budget["Allow at most budget relaxed clues<br/>Start with fresh unknown assignments"]
+    search["solve_constraints<br/>Create ConstraintSearch; call solve()"]
+    result{"Search result?"}
+    extract["Extract bulb variables<br/>Save board and actual clue penalty"]
+    lower["lower_bound = budget + 1"]
+    mid["budget = floor((lower_bound + best_score) / 2)"]
+    fallback["RecursionError: stderr diagnostic<br/>Keep the best saved board"]
+    format["Overlay saved bulbs as L<br/>Return penalty and completed grid"]
+    write["main: write stdout; exit 0"]
+
+    main --> read
+    read -->|"Invalid"| invalid
+    read -->|"Valid"| greedy
+    greedy --> score
+    score --> zero
+    zero -->|"Yes: optimal"| format
+    zero -->|"No"| build
+    build --> bounds
+    bounds --> more
+    more -->|"Yes"| budget
+    more -->|"No: minimum proven"| format
+    budget --> search
+    search --> result
+    result -->|"Model"| extract
+    result -->|"None"| lower
+    extract --> mid
+    lower --> mid
+    mid --> more
+    search -->|"RecursionError"| fallback
+    fallback --> format
+    format --> write

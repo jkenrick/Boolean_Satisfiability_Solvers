@@ -4,10 +4,10 @@ Run: python akari_solver.py < input.txt > output.txt
 """
 
 import argparse
+from collections import deque
+from heapq import heapify, heappop, heappush
 from itertools import combinations
 import sys
-
-from clause_storage import ClauseStore, STORAGE_CHOICES
 
 
 # Rows increase downward; these offsets move up, down, left, and right.
@@ -66,6 +66,8 @@ def visible_cells(grid, row, column):
 
 def build_formula(grid, storage="list"):
     """Encode lighting, bulb conflicts, and numbered clues as KNF constraints."""
+    if storage != "list":
+        raise ValueError("only list storage is supported by this standalone solver")
     cells = []
     variable_at = {}
     # Assign one Boolean variable per white cell, in row order.
@@ -77,7 +79,7 @@ def build_formula(grid, storage="list"):
                 variable_at[(row, column)] = len(cells)
 
     # Each entry is (literals, minimum); every constraint must be satisfied.
-    constraints = [] if storage == "list" else ClauseStore(storage=storage)
+    constraints = []
     # Each white cell belongs to one horizontal and one vertical segment.
     # Keep references to those segments so illumination needs no repeated rays.
     row_segments = [None] * (len(cells) + 1)
@@ -150,15 +152,6 @@ def build_formula(grid, storage="list"):
     return cells, constraints, relaxation_variables
 
 
-def learn_clause(constraints, literals):
-    """Record a clause derived from constraint explanations by resolution."""
-    # Sort and deduplicate so rediscovering a conflict does not add another copy.
-    clause = (sorted(set(literals)), 1)
-    if clause not in constraints:
-        constraints.append(clause)
-    return clause
-
-
 def solve_constraints(constraints, assignment):
     """Initialize an isolated search and return a satisfying assignment, if any."""
     return ConstraintSearch(constraints, assignment).solve()
@@ -169,24 +162,58 @@ class ConstraintSearch:
 
     def __init__(self, constraints, assignment):
         # Learned clauses and assignments stay local to this budget search.
-        self.constraints = (constraints.copy() if isinstance(constraints, ClauseStore)
-                            else list(constraints))
-        self.assignment = assignment.copy()
+        self.constraints = []
+        self.assignment = [None] * len(assignment)
         self.levels = [0] * len(assignment)
         self.reasons = [None] * len(assignment)
         self.decision_level = 0
-        # Caller-supplied values are fixed assumptions at level zero. Keep them
-        # in explanations: they need not be consequences of the formula itself.
-        self.trail = [variable if assignment[variable] else -variable
-                      for variable in range(1, len(assignment))
-                      if assignment[variable] is not None]
+        self.trail = []
+        # Slack is the number of additional false occurrences a rule allows.
+        # Only constraints containing a newly false literal need to be updated.
+        self.slack = []
+        self.positive_occurrences = [[] for _ in assignment]
+        self.negative_occurrences = [[] for _ in assignment]
+        self.pending = deque()
+        self.queued = []
+        self.learned_clauses = set()
+        # Bulbs are sparse: start with no bulb, then save successful implications
+        # and decision values for reuse after backtracking.
+        self.phases = [False] * len(assignment)
         occurrences = [0] * len(assignment)
-        for literals, minimum in self.constraints:
+        for literals, minimum in constraints:
+            self.add_constraint(literals, minimum)
             for literal in literals:
                 occurrences[abs(literal)] += 1
-        # Stable sorting breaks ties by variable ID; learning leaves this static.
-        self.branch_order = sorted(range(1, len(assignment)),
-                                   key=lambda variable: -occurrences[variable])
+        # Caller-supplied values are fixed assumptions at level zero. Keep them
+        # in explanations: they need not be consequences of the formula itself.
+        for variable in range(1, len(assignment)):
+            if assignment[variable] is not None:
+                self.assign(variable if assignment[variable] else -variable, None)
+        # Start with occurrence priorities, then favor variables in recent
+        # conflicts. This avoids repeatedly undoing thousands of unrelated choices.
+        scale = max(occurrences, default=1) or 1
+        self.activity = [count / scale for count in occurrences]
+        self.activity_increment = 1.0
+        self.branch_heap = [(-self.activity[v], v) for v in range(1, len(assignment))]
+        heapify(self.branch_heap)
+
+    def add_constraint(self, literals, minimum):
+        """Index a rule and schedule it if its current slack permits no more falsity."""
+        index = len(self.constraints)
+        self.constraints.append((literals, minimum))
+        slack = len(literals) - minimum
+        for literal in literals:
+            variable = abs(literal)
+            occurrences = (self.positive_occurrences if literal > 0
+                           else self.negative_occurrences)
+            occurrences[variable].append(index)
+            value = self.assignment[variable]
+            if value is not None and value != (literal > 0):
+                slack -= 1
+        self.slack.append(slack)
+        self.queued.append(slack <= 0)
+        if slack <= 0:
+            self.pending.append(index)
 
     def assign(self, literal, reason):
         """Append a decision or implication to the assignment trail."""
@@ -196,55 +223,49 @@ class ConstraintSearch:
         # An implication's reason contains the other, currently false literals
         # of its explaining clause. None marks a decision, not an implication.
         self.reasons[variable] = reason
+        self.phases[variable] = literal > 0
         self.trail.append(literal)
+        occurrences = (self.negative_occurrences if literal > 0
+                       else self.positive_occurrences)
+        for index in occurrences[variable]:
+            self.slack[index] -= 1
+            if self.slack[index] <= 0 and not self.queued[index]:
+                self.queued[index] = True
+                self.pending.append(index)
 
     def propagate(self):
         """Reach a propagation fixpoint, or return a false explaining clause."""
         assignment = self.assignment
-        changed = True
-        while changed:
-            changed = False
-            for literals, minimum in self.constraints:
-                if minimum <= 0:
-                    continue
-                true_count = 0
-                unknown_literals = []
-                # Count occurrences, including repeated or opposite literals.
-                for literal in literals:
-                    value = assignment[abs(literal)]
-                    if value is None:
-                        unknown_literals.append(literal)
-                    elif value == (literal > 0):
-                        true_count += 1
-                        if true_count >= minimum:
-                            break
-                if true_count >= minimum:
-                    continue
-                possible_count = true_count + len(unknown_literals)
-                if possible_count > minimum:
-                    continue
+        # === 1) Unit propagation: process only rules whose slack reaches zero ===
+        while self.pending:
+            index = self.pending.popleft()
+            self.queued[index] = False
+            literals, minimum = self.constraints[index]
+            unknown_literals = []
+            false_literals = []
+            for literal in literals:
+                value = assignment[abs(literal)]
+                if value is None:
+                    unknown_literals.append(literal)
+                elif value != (literal > 0):
+                    false_literals.append(literal)
 
-                # For an n-literal at-least-k rule, any n-k+1 occurrences form
-                # an implied OR clause. This supplies ordinary clause reasons
-                # for KNF propagation without expanding the entire rule to CNF.
-                false_literals = [literal for literal in literals
-                                  if assignment[abs(literal)] is not None
-                                  and assignment[abs(literal)] != (literal > 0)]
-                if possible_count < minimum:
-                    needed = max(0, len(literals) - minimum + 1)
-                    return frozenset(false_literals[:needed])
+            # === 5) Satisfiability check: too many false occurrences ===
+            if self.slack[index] < 0:
+                # Any n-k+1 occurrences of an at-least-k rule form an implied
+                # OR clause, including repeated occurrences and opposite signs.
+                needed = max(0, len(literals) - minimum + 1)
+                return frozenset(false_literals[:needed])
 
-                # Exactly n-k occurrences are false. Appending any forced
-                # literal gives its explaining clause. Share the fixed causes
-                # across implications from this rule instead of copying them.
-                reason = frozenset(false_literals)
-                for literal in unknown_literals:
-                    variable = abs(literal)
-                    if assignment[variable] is None:
-                        self.assign(literal, reason)
-                        changed = True
-                    elif assignment[variable] != (literal > 0):
-                        return reason | {literal}
+            # All remaining occurrences must be true. This fixed set of false
+            # literals explains each implication without expanding KNF to CNF.
+            reason = frozenset(false_literals)
+            for literal in unknown_literals:
+                variable = abs(literal)
+                if assignment[variable] is None:
+                    self.assign(literal, reason)
+                elif assignment[variable] != (literal > 0):
+                    return reason | {literal}
         return None
 
     def analyze_conflict(self, conflict):
@@ -273,37 +294,72 @@ class ConstraintSearch:
         backjump_level = max((self.levels[abs(literal)] for literal in others), default=0)
         return [asserting] + others, backjump_level
 
+    def learn_clause(self, literals):
+        """Index a logically implied clause once, for reuse after backtracking."""
+        # === 4) Clause learning ===
+        key = tuple(sorted(set(literals)))
+        if key not in self.learned_clauses:
+            self.learned_clauses.add(key)
+            self.add_constraint(list(key), 1)
+
+    def prioritize_conflict(self, literals):
+        """Raise recent conflict priorities and gradually decay older activity."""
+        for variable in {abs(literal) for literal in literals}:
+            self.activity[variable] += self.activity_increment
+        self.activity_increment /= 0.95
+        if self.activity_increment > 1e100:
+            self.activity = [value * 1e-100 for value in self.activity]
+            self.activity_increment *= 1e-100
+            self.branch_heap = [(-self.activity[v], v)
+                                for v in range(1, len(self.assignment))
+                                if self.assignment[v] is None]
+            heapify(self.branch_heap)
+
     def backtrack(self, level):
         """Undo all trail entries above the asserting level in one backjump."""
+        # === 3) Backtracking: restore assignments and cached constraint slack ===
+        while self.pending:
+            self.queued[self.pending.popleft()] = False
         while self.trail and self.levels[abs(self.trail[-1])] > level:
-            variable = abs(self.trail.pop())
+            literal = self.trail.pop()
+            variable = abs(literal)
+            occurrences = (self.negative_occurrences if literal > 0
+                           else self.positive_occurrences)
+            for index in occurrences[variable]:
+                self.slack[index] += 1
             self.assignment[variable] = None
             self.levels[variable] = 0
             self.reasons[variable] = None
+            heappush(self.branch_heap, (-self.activity[variable], variable))
         self.decision_level = level
 
     def solve(self):
-        """Propagate, learn and backjump, or make the next occurrence-based decision."""
+        """Propagate, learn and backjump, or decide by recent conflict activity."""
         while True:
             conflict = self.propagate()
             if conflict is not None:
                 if not conflict or all(self.levels[abs(literal)] == 0 for literal in conflict):
                     return None
                 learned, level = self.analyze_conflict(conflict)
-                learn_clause(self.constraints, learned)
+                self.prioritize_conflict(set(conflict) | set(learned))
+                self.learn_clause(learned)
                 self.backtrack(level)
                 # The learned clause is now unit: all other literals stayed
                 # false, and its unique highest-level variable was unassigned.
                 self.assign(learned[0], frozenset(learned[1:]))
                 continue
 
-            for variable in self.branch_order:
-                if self.assignment[variable] is None:
-                    self.decision_level += 1
-                    self.assign(variable, None)
+            # === 2) Branching: choose an unassigned variable by conflict activity ===
+            while self.branch_heap:
+                priority, variable = heappop(self.branch_heap)
+                if self.assignment[variable] is None and priority == -self.activity[variable]:
                     break
             else:
+                # === 5) Satisfiability check: no unknown variables remain ===
                 return self.assignment
+            self.decision_level += 1
+            # Reuse the last value after a backjump rather than restarting it.
+            self.assign(variable if self.phases[variable] else -variable, None)
 
 
 def greedy_fallback(grid):
@@ -407,7 +463,7 @@ def solve_grid(grid, diagnostics=None, storage="list"):
 def main(argv=None):
     """Read a puzzle from stdin and write the solution, or report invalid input."""
     parser = argparse.ArgumentParser(description="Solve an Akari puzzle from standard input.")
-    parser.add_argument("--storage", choices=("list",) + STORAGE_CHOICES, default="list",
+    parser.add_argument("--storage", choices=("list",), default="list",
                         help="clause storage representation (default: list)")
     args = parser.parse_args(argv)
     try:

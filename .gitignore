@@ -9,3 +9,5 @@ cade_cav_2002.pdf
 z3_*.py
 benchmark_akari.py
 clause_*.py
+akari_solver_z3.py
+requirements-z3.txt
