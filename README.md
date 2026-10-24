@@ -34,20 +34,28 @@ The solver searches for the lowest penalty. If the recursion limit is reached,
 it returns the best valid board found so far, which may have a higher penalty.
 
 The optional `akari_solver_z3.py` variant uses Z3 instead of the custom search.
-It shares input validation, KNF encoding, greedy bounds, zero-first binary budget
-search, and output format with the original. Each budget starts a fresh solver
-in both variants; the Z3 version translates KNF into Boolean/pseudo-Boolean
-constraints. Install its dependency into your Python environment:
+It is a standalone file containing its own input validation, KNF encoding,
+greedy bounds, zero-first binary budget search, and output formatting. These
+follow the original solver, using plain list storage. Each budget starts a fresh
+solver in both variants; the Z3 version translates KNF into Boolean/pseudo-Boolean
+constraints. Its only external dependency is `z3-solver`; install the pinned
+version into your Python environment:
 
 ```sh
 python -m pip install -r requirements-z3.txt
 ```
+
+If copying just the standalone file, install with `python -m pip install z3-solver`.
 
 Run it using the same redirection as the original:
 
 ```powershell
 cmd /c "python akari_solver_z3.py < input.txt > output_z3.txt"
 ```
+
+Diagrams show the [overall function flow](docs/akari_solver_z3_flow.svg) and
+[Z3 constraint solving](docs/akari_solver_z3_constraints.svg). Each SVG has an
+editable Mermaid `.mmd` source alongside it.
 
 Compare end-to-end runtimes with the same Python interpreter and inputs:
 

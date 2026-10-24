@@ -1,0 +1,46 @@
+flowchart TD
+    mainEntry["main(argv): parse CLI arguments"] --> dependency[["require_z3(): check package"]]
+    dependency --> readGrid[["read_grid(stdin): validate puzzle"]]
+    dependency -->|"Missing Z3"| runtimeError(["stderr error; exit 1"])
+    readGrid -->|"Invalid input"| inputError(["stderr error; exit 2"])
+    readGrid --> solveGrid["solve_grid(grid): check require_z3()"]
+
+    subgraph fallbackPhase ["greedy_fallback(grid): establish a feasible board"]
+        emptyBulbs["Start with no bulbs"] --> moreCells{"Another white cell?"}
+        moreCells -->|"Yes"| visibleCells[["visible_cells(): self and four rays"]]
+        visibleCells --> placeBulb["Add bulb if no visible bulb"]
+        placeBulb --> moreCells
+    end
+
+    solveGrid --> emptyBulbs
+    moreCells -->|"No"| initialScore[["count_violations(): save best_score"]]
+    initialScore --> zeroScore{"best_score = 0?"}
+    zeroScore -->|"Yes; already optimal"| formatOutput["Overlay saved bulbs as L; return score and grid"]
+    zeroScore -->|"No"| buildFormula[["build_formula(): lighting, conflicts, relaxed clues"]]
+    buildFormula --> initializeBounds["Set lower_bound = 0; budget = 0"]
+
+    subgraph searchPhase ["Exact search inside solve_grid()"]
+        remainingBudget{"lower_bound < best_score?"}
+        remainingBudget -->|"Yes"| addBudget["Allow at most budget relaxed clues"]
+        addBudget --> solveConstraints[["solve_constraints(): fresh unknown assignment"]]
+        solveConstraints --> searchResult{"Result?"}
+        searchResult -->|"SAT: model"| extractBulbs["Extract bulb variables from model"]
+        extractBulbs --> actualScore[["count_violations(): save bulbs and actual best_score"]]
+        searchResult -->|"UNSAT: None"| increaseLower["Set lower_bound = budget + 1"]
+        actualScore --> nextBudget["budget = floor((lower_bound + best_score) / 2)"]
+        increaseLower --> nextBudget
+        nextBudget --> remainingBudget
+    end
+
+    initializeBounds --> remainingBudget
+    searchResult -->|"Unknown: RuntimeError"| runtimeError
+    remainingBudget -->|"No; minimum proven"| formatOutput
+    formatOutput --> writeOutput["main(): write result to stdout"]
+    writeOutput --> successfulExit(["Exit 0"])
+
+    style fallbackPhase fill:#F5F5F5,stroke:#B3B3B3
+    style searchPhase fill:#C2E5FF,stroke:#3DADFF
+    style formatOutput fill:#CDF4D3,stroke:#66D575
+    style successfulExit fill:#CDF4D3,stroke:#66D575
+    style runtimeError fill:#FFCDC2,stroke:#FF7556
+    style inputError fill:#FFCDC2,stroke:#FF7556
