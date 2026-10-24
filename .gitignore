@@ -1,2 +1,11 @@
 akari_knf.py
-test_*.py
+test*.py
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pycache
+cade_cav_2002.pdf
+z3_*.py
+benchmark_akari.py
+clause_*.py

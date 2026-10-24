@@ -3,8 +3,11 @@
 Run: python akari_solver.py < input.txt > output.txt
 """
 
+import argparse
 from itertools import combinations
 import sys
+
+from clause_storage import ClauseStore, STORAGE_CHOICES
 
 
 # Rows increase downward; these offsets move up, down, left, and right.
@@ -61,7 +64,7 @@ def visible_cells(grid, row, column):
     return visible
 
 
-def build_formula(grid):
+def build_formula(grid, storage="list"):
     """Encode lighting, bulb conflicts, and numbered clues as KNF constraints."""
     cells = []
     variable_at = {}
@@ -74,18 +77,35 @@ def build_formula(grid):
                 variable_at[(row, column)] = len(cells)
 
     # Each entry is (literals, minimum); every constraint must be satisfied.
-    constraints = []
-    # Encode illumination and bulb conflicts for every white cell.
-    for row, column in cells:
-        variable = variable_at[(row, column)]
-        visible_variables = []
-        for position in visible_cells(grid, row, column):
-            other = variable_at[position]
-            visible_variables.append(other)
-            # Process each visible pair once, excluding a cell paired with itself.
-            if variable < other:
-                # NOT x OR NOT y: at least one of the two cells has no bulb.
-                constraints.append(([-variable, -other], 1))
+    constraints = [] if storage == "list" else ClauseStore(storage=storage)
+    # Each white cell belongs to one horizontal and one vertical segment.
+    # Keep references to those segments so illumination needs no repeated rays.
+    row_segments = [None] * (len(cells) + 1)
+    column_segments = [None] * (len(cells) + 1)
+    for segment_at, row_step, column_step in (
+        (row_segments, 0, 1), (column_segments, 1, 0)
+    ):
+        for row, column in cells:
+            if segment_at[variable_at[(row, column)]] is not None:
+                continue
+            segment = []
+            # Row order ensures this is the first white cell in the segment.
+            while (row, column) in variable_at:
+                variable = variable_at[(row, column)]
+                segment.append(variable)
+                segment_at[variable] = segment
+                row += row_step
+                column += column_step
+            if len(segment) > 1:
+                # At most one bulb: at least n-1 cells must have no bulb.
+                constraints.append(([-variable for variable in segment],
+                                    len(segment) - 1))
+
+    for variable in range(1, len(cells) + 1):
+        # The segments intersect at this cell; include its variable only once.
+        visible_variables = row_segments[variable] + [
+            other for other in column_segments[variable] if other != variable
+        ]
         # At least one visible position, including this cell, must have a bulb.
         constraints.append((visible_variables, 1))
 
@@ -130,17 +150,10 @@ def build_formula(grid):
     return cells, constraints, relaxation_variables
 
 
-def learn_clause(constraints, conflict_reasons):
-    """Record a clause excluding a decision combination proven contradictory.
-
-    conflict_reasons contains signed decision literals whose conjunction implies
-    a conflict. Negating that conjunction gives a clause implied by the formula.
-    Call only with causes established by propagation, not arbitrary assignments.
-    An empty cause set proves the formula itself unsatisfiable.
-    """
-    # Clause learning 
+def learn_clause(constraints, literals):
+    """Record a clause derived from constraint explanations by resolution."""
     # Sort and deduplicate so rediscovering a conflict does not add another copy.
-    clause = (sorted(-literal for literal in set(conflict_reasons)), 1)
+    clause = (sorted(set(literals)), 1)
     if clause not in constraints:
         constraints.append(clause)
     return clause
@@ -148,120 +161,176 @@ def learn_clause(constraints, conflict_reasons):
 
 def solve_constraints(constraints, assignment):
     """Initialize an isolated search and return a satisfying assignment, if any."""
-    # Share learned clauses across siblings, but never across penalty budgets
-    # or separate calls. Copy the formula so learning leaves the caller's intact.
-    search_constraints = list(constraints)
-    reasons = [None] * len(assignment)
-    for variable in range(1, len(assignment)):
-        if assignment[variable] is not None:
-            # Treat caller-supplied assignments as assumptions, not formula facts.
-            literal = variable if assignment[variable] else -variable
-            reasons[variable] = {literal}
-    return search_assignments(search_constraints, assignment, reasons)
+    return ConstraintSearch(constraints, assignment).solve()
 
 
-def search_assignments(constraints, assignment, reasons):
-    """Recursively propagate, learn from conflicts, and branch on assignments."""
-    # Invariant: the formula plus reasons[v] implies v's assigned value.
-    # Cause sets are never mutated after they are stored in reasons.
-    # Assignments are None (unknown), True, or False; variable ID 0 is unused.
-    changed = True
-    # Repeat until no more assignments can be forced.
-    while changed:
-        changed = False
-        # Recount each rule from its current assignments instead of caching counts.
-        for literals, minimum in constraints:
-            true_count = 0
-            unknown_literals = []
-            conflict_reasons = set()
-            # Count listed occurrences; repeated literals each count separately.
+class ConstraintSearch:
+    """Iterative KNF search with FirstUIP learning and non-chronological backtracking."""
+
+    def __init__(self, constraints, assignment):
+        # Learned clauses and assignments stay local to this budget search.
+        self.constraints = (constraints.copy() if isinstance(constraints, ClauseStore)
+                            else list(constraints))
+        self.assignment = assignment.copy()
+        self.levels = [0] * len(assignment)
+        self.reasons = [None] * len(assignment)
+        self.decision_level = 0
+        # Caller-supplied values are fixed assumptions at level zero. Keep them
+        # in explanations: they need not be consequences of the formula itself.
+        self.trail = [variable if assignment[variable] else -variable
+                      for variable in range(1, len(assignment))
+                      if assignment[variable] is not None]
+        occurrences = [0] * len(assignment)
+        for literals, minimum in self.constraints:
             for literal in literals:
-                value = assignment[abs(literal)]
-                if value is None:
-                    unknown_literals.append(literal)
-                elif value == (literal > 0):
-                    true_count += 1
-                else:
-                    # These decisions suffice to keep this occurrence false.
-                    conflict_reasons.update(reasons[abs(literal)])
+                occurrences[abs(literal)] += 1
+        # Stable sorting breaks ties by variable ID; learning leaves this static.
+        self.branch_order = sorted(range(1, len(assignment)),
+                                   key=lambda variable: -occurrences[variable])
 
-            # Satisfiability checks: satisfied constraint or conflict 
-            if true_count >= minimum:
-                continue
-            # True plus unknown occurrences bounds the maximum still achievable.
-            possible_count = true_count + len(unknown_literals)
-            if possible_count < minimum:
-                # Even making every unknown literal true cannot rescue this rule.
-                learn_clause(constraints, conflict_reasons)
-                # Backtracking: reject this conflicting branch 
-                # Return to the caller, which can try its next decision value.
-                return None
+    def assign(self, literal, reason):
+        """Append a decision or implication to the assignment trail."""
+        variable = abs(literal)
+        self.assignment[variable] = literal > 0
+        self.levels[variable] = self.decision_level
+        # An implication's reason contains the other, currently false literals
+        # of its explaining clause. None marks a decision, not an implication.
+        self.reasons[variable] = reason
+        self.trail.append(literal)
 
-            #  Unit propagation 
-            # Generalized for KNF: force all remaining literals when all are needed.
-            if possible_count == minimum:
+    def propagate(self):
+        """Reach a propagation fixpoint, or return a false explaining clause."""
+        assignment = self.assignment
+        changed = True
+        while changed:
+            changed = False
+            for literals, minimum in self.constraints:
+                if minimum <= 0:
+                    continue
+                true_count = 0
+                unknown_literals = []
+                # Count occurrences, including repeated or opposite literals.
+                for literal in literals:
+                    value = assignment[abs(literal)]
+                    if value is None:
+                        unknown_literals.append(literal)
+                    elif value == (literal > 0):
+                        true_count += 1
+                        if true_count >= minimum:
+                            break
+                if true_count >= minimum:
+                    continue
+                possible_count = true_count + len(unknown_literals)
+                if possible_count > minimum:
+                    continue
+
+                # For an n-literal at-least-k rule, any n-k+1 occurrences form
+                # an implied OR clause. This supplies ordinary clause reasons
+                # for KNF propagation without expanding the entire rule to CNF.
+                false_literals = [literal for literal in literals
+                                  if assignment[abs(literal)] is not None
+                                  and assignment[abs(literal)] != (literal > 0)]
+                if possible_count < minimum:
+                    needed = max(0, len(literals) - minimum + 1)
+                    return frozenset(false_literals[:needed])
+
+                # Exactly n-k occurrences are false. Appending any forced
+                # literal gives its explaining clause. Share the fixed causes
+                # across implications from this rule instead of copying them.
+                reason = frozenset(false_literals)
                 for literal in unknown_literals:
                     variable = abs(literal)
-                    needed_value = literal > 0
                     if assignment[variable] is None:
-                        assignment[variable] = needed_value
-                        # The same fixed causes justify every value forced here.
-                        reasons[variable] = conflict_reasons
+                        self.assign(literal, reason)
                         changed = True
-                    elif assignment[variable] != needed_value:
-                        # Satisfiability check: contradictory forced values 
-                        # Opposite occurrences demand both values of this variable.
-                        learn_clause(constraints,
-                                     conflict_reasons | reasons[variable])
-                        # Backtracking: reject this conflicting branch 
-                        return None
+                    elif assignment[variable] != (literal > 0):
+                        return reason | {literal}
+        return None
 
-    # Branching 
-    # Choose the first unknown variable and try both values.
-    for variable in range(1, len(assignment)):
-        if assignment[variable] is None:
-            for value in (True, False):
-                # Copy assignments and reason references to preserve the parent.
-                # After a failed child, retry from this same parent state.
-                branch = assignment.copy()
-                branch[variable] = value
-                branch_reasons = reasons.copy()
-                branch_reasons[variable] = {variable if value else -variable}
-                model = search_assignments(constraints, branch, branch_reasons)
-                if model is not None:
-                    return model
+    def analyze_conflict(self, conflict):
+        """Resolve backwards to the first clause with one current-level literal."""
+        clause = set(conflict)
+        current_level = max(self.levels[abs(literal)] for literal in clause)
+        pending = sum(self.levels[abs(literal)] == current_level for literal in clause)
+        index = len(self.trail) - 1
+        while pending > 1:
+            literal = -self.trail[index]
+            index -= 1
+            if literal not in clause or self.levels[abs(literal)] != current_level:
+                continue
+            # Resolve away the most recently implied variable. Its reason
+            # mentions only assignments earlier on the trail.
+            clause.remove(literal)
+            pending -= 1
+            for cause in self.reasons[abs(literal)]:
+                if cause not in clause:
+                    clause.add(cause)
+                    pending += self.levels[abs(cause)] == current_level
 
-            # Backtracking: both decision values failed 
-            # Unwind to the caller's decision loop. Child assignments stay local;
-            # learned clauses remain shared, so later branches can reuse them.
-            return None
-    # Satisfiability check: complete satisfying assignment 
-    # Propagation found no conflicts, and branching found no unknown variables.
-    return assignment
+        asserting = next(literal for literal in clause
+                         if self.levels[abs(literal)] == current_level)
+        others = sorted(clause - {asserting})
+        backjump_level = max((self.levels[abs(literal)] for literal in others), default=0)
+        return [asserting] + others, backjump_level
+
+    def backtrack(self, level):
+        """Undo all trail entries above the asserting level in one backjump."""
+        while self.trail and self.levels[abs(self.trail[-1])] > level:
+            variable = abs(self.trail.pop())
+            self.assignment[variable] = None
+            self.levels[variable] = 0
+            self.reasons[variable] = None
+        self.decision_level = level
+
+    def solve(self):
+        """Propagate, learn and backjump, or make the next occurrence-based decision."""
+        while True:
+            conflict = self.propagate()
+            if conflict is not None:
+                if not conflict or all(self.levels[abs(literal)] == 0 for literal in conflict):
+                    return None
+                learned, level = self.analyze_conflict(conflict)
+                learn_clause(self.constraints, learned)
+                self.backtrack(level)
+                # The learned clause is now unit: all other literals stayed
+                # false, and its unique highest-level variable was unassigned.
+                self.assign(learned[0], frozenset(learned[1:]))
+                continue
+
+            for variable in self.branch_order:
+                if self.assignment[variable] is None:
+                    self.decision_level += 1
+                    self.assign(variable, None)
+                    break
+            else:
+                return self.assignment
 
 
 def greedy_fallback(grid):
     """Place nonconflicting bulbs until every white cell is illuminated."""
     # Store board positions so the fallback works independently of the formula.
     bulbs = []
+    bulb_positions = set()
     for row in range(len(grid)):
         for column in range(len(grid[0])):
             if grid[row][column] == ".":
                 already_lit = False
                 # Any visible existing bulb means this cell needs no new one.
                 for position in visible_cells(grid, row, column):
-                    if position in bulbs:
+                    if position in bulb_positions:
                         already_lit = True
                         break
                 # An unlit cell sees no existing bulb, so adding one is conflict-free.
                 if not already_lit:
                     bulbs.append((row, column))
+                    bulb_positions.add((row, column))
     # Skipped cells stay lit because bulbs are never removed; R1 is always zero.
     return bulbs
 
 
 def count_violations(grid, bulbs):
     """Count numbered clues whose adjacent bulb count differs from their digit."""
+    bulbs = set(bulbs)
     violations = 0
     for row in range(len(grid)):
         for column in range(len(grid[0])):
@@ -278,28 +347,31 @@ def count_violations(grid, bulbs):
     return violations
 
 
-def solve_grid(grid, diagnostics=None):
+def solve_grid(grid, diagnostics=None, storage="list"):
     """Find the minimum clue penalty and format the score and completed grid."""
     # Establish a fully lit, nonconflicting answer before starting the exact search.
     best_bulbs = greedy_fallback(grid)
     best_score = count_violations(grid, best_bulbs)
     # A zero penalty is already optimal, so no search is needed.
     if best_score > 0:
-        cells, constraints, relaxations = build_formula(grid)
+        cells, constraints, relaxations = build_formula(grid, storage)
         # A negated relaxation is true when its clue must be enforced.
         negative_relaxations = []
         for variable in relaxations:
             negative_relaxations.append(-variable)
         try:
-            # Try budgets in increasing order. The greedy score is already
-            # feasible, so the first smaller feasible budget proves optimality.
-            for budget in range(best_score):
+            # First try zero; then binary-search between the smallest possible
+            # penalty and the best feasible score. Each failed budget raises the
+            # lower bound; each model can improve the saved board and upper bound.
+            lower_bound = 0
+            budget = 0
+            while lower_bound < best_score:
                 # With m clues and budget b, at least m-b must be enforced.
                 # Add this budget without changing the base puzzle constraints.
                 limited = constraints + [(negative_relaxations, len(relaxations) - budget)]
                 # Start each budget with fresh unknowns for bulbs and relaxations.
                 assignment = [None] * (len(cells) + len(relaxations) + 1)
-                # Recursive search may take exponential time on difficult boards.
+                # Exact search may take exponential time on difficult boards.
                 model = solve_constraints(limited, assignment)
                 if model is not None:
                     best_bulbs = []
@@ -309,14 +381,14 @@ def solve_grid(grid, diagnostics=None):
                             best_bulbs.append(position)
                     # Score the actual board, since permitted violations may be unused.
                     best_score = count_violations(grid, best_bulbs)
-                    break
-                # An impossible budget leads to the next, less restrictive one.
-            # If every smaller budget fails, the greedy board is itself optimal.
+                else:
+                    lower_bound = budget + 1
+                budget = (lower_bound + best_score) // 2
+            # Matching bounds prove the saved board has the minimum penalty.
         except RecursionError:
-            # Too many nested decisions can exceed Python's call-stack limit.
-            # The greedy board is still valid, but optimality is then unknown.
+            # Preserve the best board if a helper reaches the recursion limit.
             if diagnostics is not None:
-                print("Recursion limit reached; using the greedy board.", file=diagnostics)
+                print("Recursion limit reached; using the best board found.", file=diagnostics)
 
     completed = []
     # Copy rows into mutable lists while leaving the input puzzle unchanged.
@@ -332,12 +404,16 @@ def solve_grid(grid, diagnostics=None):
     return output
 
 
-def main():
+def main(argv=None):
     """Read a puzzle from stdin and write the solution, or report invalid input."""
+    parser = argparse.ArgumentParser(description="Solve an Akari puzzle from standard input.")
+    parser.add_argument("--storage", choices=("list",) + STORAGE_CHOICES, default="list",
+                        help="clause storage representation (default: list)")
+    args = parser.parse_args(argv)
     try:
         # Pass stderr separately so search diagnostics never enter the board output.
         grid = read_grid(sys.stdin)
-        output = solve_grid(grid, sys.stderr)
+        output = solve_grid(grid, sys.stderr, args.storage)
     except ValueError as error:
         # Reject invalid input before writing any partial board to stdout.
         print("Invalid input: " + str(error), file=sys.stderr)
